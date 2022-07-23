@@ -1,0 +1,330 @@
+% Simplex Method Script
+
+clc
+close all
+clear all
+
+curr_dir = pwd;
+
+% Load in sample thruster table. Feel free to generate your own using the
+% placement tool
+t_table = csvread([curr_dir,'/T_table.csv'],1,0);
+N = size(t_table,1);
+
+%==========================================================================
+% User inputs
+
+
+L_ref = [1;1;0]; % Desired torque components in body frame
+F_ref = [0;0;0]; % Desired translational force components in body frame
+
+rCG_B = [0.1;...
+    0.25;...
+    0.00]; % Spacecraft CG referenced from bottom of spacecraft (so still
+%            body frame, but origin is at bottom of spacecraft)
+
+%==========================================================================
+
+F = t_table(:,8);
+rvec_B = t_table(:,2:4)'; % Thruster location in body frame
+fvec_B = t_table(:,5:7)'; % Thruster force direction in body frame
+Fvec_B = (t_table(:,5:7).*F)'; % Thruster force vector in body frame
+Lvec_B = cross((rvec_B - rCG_B),Fvec_B); % thruster torque in body frame
+
+
+%==========================================================================
+% This portion looks at each thruster to determine which ones contribute to
+% obtaining the desired torque and translational forces defined by L_ref
+% and F_ref. The method considers the two goals separately, then uses a
+% basic voting scheme to award "points" to thrusters that do one or both
+
+
+% Projection of individual thruster force/torque in body frame directions
+d_arr = [dot(cross((rvec_B - rCG_B),fvec_B),repmat([1;0;0],1,N));...
+         dot(cross((rvec_B - rCG_B),fvec_B),repmat([0;1;0],1,N));...
+         dot(cross((rvec_B - rCG_B),fvec_B),repmat([0;0;1],1,N))];
+g_arr = [dot(fvec_B,repmat([1;0;0],1,N));...
+         dot(fvec_B,repmat([0;1;0],1,N));...
+         dot(fvec_B,repmat([0;0;1],1,N))];
+Dx = d_arr(1,:); % Portion of thruster torque in x-direction
+Dy = d_arr(2,:); % Portion of thruster torque in y-direction
+Dz = d_arr(3,:); % Portion of thruster torque in x-direction
+Gx = g_arr(1,:); % Portion of thruster force direction in x-direction
+Gy = g_arr(2,:); % Portion of thruster force direction in y-direction
+Gz = g_arr(3,:); % Portion of thruster force direction in z-direction
+
+
+% This tells you what the force thruster N would need to have to provide
+% the torque necessary to get the x,y,z component of the desired torque. So
+% negative values imply the thruster should not be used (or should be
+% flipped to point the other way...)
+Fx = (Dx')*(Dx*(Dx'))^(-1)*dot(L_ref,[1;0;0]);
+Fy = (Dy')*(Dy*(Dy'))^(-1)*dot(L_ref,[0;1;0]);
+Fz = (Dz')*(Dz*(Dz'))^(-1)*dot(L_ref,[0;0;1]);
+
+% This tells you what the force thruster N would need to have to provide
+% the force necessary to get the x,y,z component of the desired force. So
+% negative values imply the thruster should not be used (or should be
+% flipped to point the other way...)
+FFx = (Gx')*(Gx*(Gx'))^(-1)*dot(F_ref,[1;0;0]);
+FFy = (Gy')*(Gy*(Gy'))^(-1)*dot(F_ref,[0;1;0]);
+FFz = (Gz')*(Gz*(Gz'))^(-1)*dot(F_ref,[0;0;1]);
+
+% These logical arrays indicate which thrusters provide a positive
+% contribution to achieving the desired torque and force. A 1, or true,
+% means the thruster helps by some extent
+IIx = (Fx > 0); % x torque component
+IIy = (Fy > 0); % y torque component
+IIz = (Fz > 0); % z torque component
+IIfx = (FFx > 0); % x force component
+IIfy = (FFy > 0); % y force component
+IIfz = (FFz > 0); % z force component
+
+%==========================================================================
+
+
+% These are the standard matrices in Ax = b
+A = [Fvec_B;Lvec_B]; % thruster forces and torques
+b = [F_ref;L_ref]; % desired force and torque
+
+TRGT_PEN = 1e6*ones(length(b),1); % Penalty for missing commanded force/torque
+BND_PEN = 1e0; % Penalty for using more than upper bound for thruster
+PROP_PEN = 1e1; % Penalty for prop usage
+TNUM_PEN = 1e0; % Penalty for using more than k-thrusters
+TNUM_LIM = sum(F_ref > 0) + sum(L_ref > 0); % Maximum number of thrusters that 
+%                                             can be used before cost is
+%                                             penalized
+
+G_mat = diag(TRGT_PEN); % Penalty for missing desired torque/force applied evenly
+%                         for all terms, so G_mat*(Ax-b)
+
+X_LB = 0*ones(N,1); % Lower bound on thruster force. Strictly enforced
+X_UB = 50*ones(N,1); % Upper bound on thruster force. BND_PEN enforces this
+XI = 1:N; % Acts as a switch. Each column with a '1' means the optimizer is 
+%           free to select the optimal value to do the thing. If it is set
+%           to '0', then that thruster will maintain its initial guess
+%           value
+ISP = ones(N,1); % This is the thruster mass flow rate. It is used in the
+%                  cost function to determine a measure of prop usage
+
+X_init = (X_UB - X_LB)*.05; % This is the initial guess. I assume all thrusters
+%                             are initially on, but at a very low force
+%                             value such that the optimizer is more likely
+%                             to turn off ones that don't do much to help
+%                             the cause while increasing those that do
+
+say_stuff = false; % This is the 'verbose' flag that will output lots of info
+%                    on the cost function terms and constraints
+
+% This is an optional argument passed to simps. It provides simps and the
+% constraint function with all of the parameters it needs to do the thing
+f_args = {A,b,ISP,G_mat,BND_PEN,PROP_PEN,TNUM_PEN,TNUM_LIM,X_LB,X_UB,say_stuff};
+
+% Here is a basic voting scheme for the thrusters. A thruster is awarded a
+% point for each component of desired force/torque it helps to achieve
+% based on the II arrays computed earlier.
+% NOTE: A better way to do this might be to weigh it based on its specific
+% contribution instead of a binary on/off. This info is held within the
+% Fx/FFx, and so on, arrays
+T_vote = sum([IIx,IIfx,IIy,IIfy,IIz,IIfz],2);
+
+XI(T_vote == 0) = []; % Don't use thrusters that
+ISP(T_vote > 1) = (1./(T_vote(T_vote > 1))).^2;
+X_init(T_vote == 0) = 0;
+
+options = zeros(1,14);
+options(2) = 1e-4;
+options(3) = 1e-4;
+options(14) = 100*N;
+[x_opt,options] = simps(@T_CONSTRAINT,X_init,XI,options,X_LB,X_UB,f_args);
+% [~,x_opt] = nma_simplex(A,b,ISP,false);
+
+say_stuff = true;
+f_args = {A,b,ISP,G_mat,BND_PEN,PROP_PEN,TNUM_PEN,TNUM_LIM,X_LB,X_UB,say_stuff};
+
+Fvec_LP = (t_table(:,5:7).*x_opt)';
+Lvec_LP = cross((rvec_B - rCG_B),Fvec_LP);
+
+[x_opt,T_vote,ISP]
+[fmin_test,~] = T_CONSTRAINT(x_opt',f_args)
+A*(x_opt) - b
+Fsum_LP = sum(Fvec_LP,2)
+Lsum_LP = sum(Lvec_LP,2)
+
+% F(x_opt ~= 0) = x_opt(x_opt ~= 0);
+% Fvec_B = (t_table(:,5:7).*F)'; % Thruster force vector in body frame
+% Lvec_B = cross((rvec_B - rCG_B),Fvec_B); % thruster torque in body frame
+% A = [Fvec_B;Lvec_B];
+%
+% [~,x_opt_test] = nma_simplex(A,b,f,false);
+% x_opt_test
+
+
+if 0
+    % Portion of thruster force direction in body frame directions
+    d_arr = [dot(cross((rvec_B - rCG_B),fvec_B),repmat([1;0;0],1,N));...
+        dot(cross((rvec_B - rCG_B),fvec_B),repmat([0;1;0],1,N));...
+        dot(cross((rvec_B - rCG_B),fvec_B),repmat([0;0;1],1,N))];
+    g_arr = [dot(fvec_B,repmat([1;0;0],1,N));...
+        dot(fvec_B,repmat([0;1;0],1,N));...
+        dot(fvec_B,repmat([0;0;1],1,N))];
+    Dx = d_arr(1,:);
+    Dy = d_arr(2,:);
+    Dz = d_arr(3,:);
+    Gx = g_arr(1,:);
+    Gy = g_arr(2,:);
+    Gz = g_arr(3,:);
+
+    % Portion of thruster torque in body frame directions
+    Tx = Dx*F;
+    Ty = Dy*F;
+    Tz = Dz*F;
+
+    % N thruster force in body frame basis directions
+    Fx = (Dx')*(Dx*(Dx'))^(-1)*dot(L_ref,[1;0;0]);
+    Fy = (Dy')*(Dy*(Dy'))^(-1)*dot(L_ref,[0;1;0]);
+    Fz = (Dz')*(Dz*(Dz'))^(-1)*dot(L_ref,[0;0;1]);
+
+    FFx = (Gx')*(Gx*(Gx'))^(-1)*dot(F_ref,[1;0;0]);
+    FFy = (Gy')*(Gy*(Gy'))^(-1)*dot(F_ref,[0;1;0]);
+    FFz = (Gz')*(Gz*(Gz'))^(-1)*dot(F_ref,[0;0;1]);
+
+    % Only locate thrusters that produce positive force in basis directions
+    IIx = (Fx > 0);
+    IIy = (Fy > 0);
+    IIz = (Fz > 0);
+    IIfx = (FFx > 0);
+    IIfy = (FFy > 0);
+    IIfz = (FFz > 0);
+
+    % Subset of thrusters that have positive forces in basis directions
+    Fbarx = Fx.*IIx;
+    Fbary = Fy.*IIy;
+    Fbarz = Fz.*IIz;
+
+    % Mapping matrices that map Fbar vectors into torques
+    Dbarx = cross(t_table(:,2:4)',t_table(:,5:7)');
+    Dbary = cross(t_table(:,2:4)',t_table(:,5:7)');
+    Dbarz = cross(t_table(:,2:4)',t_table(:,5:7)');
+
+    Dbarx(:,IIx == 0) = zeros(3,sum(IIx ~= 1));
+    Dbary(:,IIy == 0) = zeros(3,sum(IIy ~= 1));
+    Dbarz(:,IIz == 0) = zeros(3,sum(IIz ~= 1));
+
+    % Thruster force directions associated with Fbars
+    Gbarx = (t_table(:,5:7)');
+    Gbary = (t_table(:,5:7)');
+    Gbarz = (t_table(:,5:7)');
+
+    Gbarx(:,IIx == 0) = zeros(3,sum(IIx~=1));
+    Gbary(:,IIy == 0) = zeros(3,sum(IIy~=1));
+    Gbarz(:,IIz == 0) = zeros(3,sum(IIz~=1));
+
+
+    % Base optimal thruster forces that produce (exactly?) the desired torque
+    % while minimizing the translational force acting on the vehicle
+    % J = 1/2Fj'*[Gt]'[Gt]Fj + LM'([D]Fj - Lr)
+
+    % x-direction
+    matx = [(Gbarx)'*Gbarx,Dbarx';Dbarx,zeros(3,3)];
+
+    [~,ICx] = licols(matx);
+    matx1 = matx(ICx,ICx);
+
+    IIxgz = any(matx,2);
+    matx(~any(matx,2),:) = [];
+    matx(:,~any(matx,1)) = [];
+
+    [Ux,Sx,Vx] = svd(matx);
+    matx_inv = Vx*(Sx\(Ux'));
+    if isempty(matx)
+        testx = zeros(N+3,1);
+        testx1 = zeros(N+3,1);
+        thangx = zeros(N+3,1);thangx1 = zeros(N+3,1);
+    else
+        testx = matx_inv*[zeros(length(matx)-3,1);L_ref];
+        testx1 = (matx1)^(-1)*[zeros(length(matx1)-3,1);L_ref];
+        thangx = zeros(N+3,1);thangx1 = zeros(N+3,1);
+        thangx(IIxgz) = testx;
+        thangx1(ICx) = testx1;
+    end
+
+
+    ultra_testx = [thangx,thangx1];
+
+    % y-direction
+    maty = [(Gbary)'*Gbary,Dbary';Dbary,zeros(3,3)];
+
+    [~,ICy] = licols(maty);
+    maty1 = maty(ICy,ICy);
+
+    IIygz = any(maty,2);
+    maty(~any(maty,2),:) = [];
+    maty(:,~any(maty,1)) = [];
+
+    [Uy,Sy,Vy] = svd(maty);
+    maty_inv = Vy*(Sy\(Uy'));
+    if isempty(maty)
+        testy = zeros(N+3,1);
+        testy1 = zeros(N+3,1);
+        thangy = zeros(N+3,1);thangy1 = zeros(N+3,1);
+    else
+        testy = maty_inv*[zeros(length(maty)-3,1);L_ref];
+        testy1 = (maty1)^(-1)*[zeros(length(maty1)-3,1);L_ref];
+        thangy = zeros(N+3,1);thangy1 = zeros(N+3,1);
+        thangy(IIygz) = testy;
+        thangy1(ICy) = testy1;
+    end
+
+
+    ultra_testy = [thangy,thangy1];
+
+    % z-direction
+    matz = [(Gbarz)'*Gbarz,Dbarz';Dbarz,zeros(3,3)];
+
+    [~,ICz] = licols(matz);
+    matz1 = matz(ICz,ICz);
+
+    IIzgz = any(matz,2);
+    matz(~any(matz,2),:) = [];
+    matz(:,~any(matz,1)) = [];
+
+    [Uz,Sz,Vz] = svd(matz);
+    matz_inv = Vz*(Sz\(Uz'));
+    if isempty(matz)
+        testz = zeros(N+3,1);
+        testz1 = zeros(N+3,1);
+        thangz = zeros(N+3,1);thangz1 = zeros(N+3,1);
+    else
+        testz = matz_inv*[zeros(length(matz)-3,1);L_ref];
+        testz1 = (matz1)^(-1)*[zeros(length(matz1)-3,1);L_ref];
+        thangz = zeros(N+3,1);thangz1 = zeros(N+3,1);
+        thangz(IIzgz) = testz;
+        thangz1(ICz) = testz1;
+    end
+
+
+    ultra_testz = [thangz,thangz1];
+
+    bigginz_thang = ultra_testx + ultra_testy + ultra_testz
+
+    Fvec_OPT_B = (t_table(:,5:7).*bigginz_thang(1:N,1))';
+    Lvec_OPT_B = cross((rvec_B - rCG_B),Fvec_OPT_B);
+    Fvec_OPT1_B = (t_table(:,5:7).*bigginz_thang(1:N,2))';
+    Lvec_OPT1_B = cross((rvec_B - rCG_B),Fvec_OPT1_B);
+
+
+    % Minimize difference between torque ref and force ref
+    Fx_min = ((Dbarx')*L_ref + (Gbarx')*F_ref)\((Gbarx)'*Gbarx + (Dbarx)'*Dbarx);
+    Fy_min = ((Dbary')*L_ref + (Gbary')*F_ref)\((Gbary)'*Gbary + (Dbary)'*Dbary);
+    Fz_min = ((Dbarz')*L_ref + (Gbarz')*F_ref)\((Gbarz)'*Gbarz + (Dbarz)'*Dbarz);
+
+    Fvec_OPT2_B = (t_table(:,5:7).*(Fx_min+Fy_min+Fz_min)')';
+    Lvec_OPT2_B = cross((rvec_B - rCG_B),Fvec_OPT2_B);
+
+
+    [sum(Fvec_OPT_B,2),sum(Lvec_OPT_B,2),sum(Fvec_OPT1_B,2),sum(Lvec_OPT1_B,2),sum(Fvec_OPT2_B,2),sum(Lvec_OPT2_B,2)]
+
+end
+
+
